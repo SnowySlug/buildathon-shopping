@@ -26,9 +26,33 @@ template<class F>void task_rows(const Task&task,size_t n,F f){auto*base=task.fil
     if(!task.begin||p[-1]!='\n'){const char*q=(const char*)memchr(p,'\n',limit-p);if(!q)return;p=q+1;}
     while(p<limit&&p<base+task.end){const char*q=(const char*)memchr(p,'\n',limit-p);if(!q)q=limit;if(view_fields(SV(p,q-p),values,n))f(values);p=q==limit?limit:q+1;}
 }
-struct Meta{Union uf;unordered_map<string,uint32_t> products,campaign;unordered_map<string,uint32_t> category_ids;vector<string>categories,campaigns,channels;uint32_t unknown,organic;
+
+// Built only after all unions complete. The UF owns every referenced byte string
+// and is immutable for the rest of execution, including all worker threads.
+struct AliasFlat{
+    struct Entry{SV key,value;uint64_t hash;};
+    struct Slot{uint32_t fingerprint=0,index=UINT32_MAX;};
+    vector<Entry>entries;vector<Slot>slots;
+    void build(const Union&uf){
+        size_t cap=8;while(cap<uf.index.size()+uf.index.size()/3+1)cap*=2;
+        slots.resize(cap);entries.reserve(uf.index.size());
+        for(auto&[key,index]:uf.index){int root=index;while(uf.parent[root]!=root)root=uf.parent[root];
+            uint64_t hash=std::hash<SV>{}(key);size_t k=hash&(slots.size()-1);
+            while(slots[k].index!=UINT32_MAX)k=(k+1)&(slots.size()-1);
+            if(entries.size()>=UINT32_MAX)throw runtime_error("alias table too large");
+            slots[k]={uint32_t(hash>>32),uint32_t(entries.size())};entries.push_back({key,uf.minimum[root],hash});
+        }
+    }
+    SV name(SV key)const{
+        uint64_t hash=std::hash<SV>{}(key);uint32_t fp=hash>>32;size_t k=hash&(slots.size()-1);
+        while(slots[k].index!=UINT32_MAX){if(slots[k].fingerprint==fp){const auto&e=entries[slots[k].index];if(e.hash==hash&&e.key==key)return e.value;}k=(k+1)&(slots.size()-1);}
+        return key;
+    }
+};
+struct Meta{Union uf;AliasFlat aliases;unordered_map<string,uint32_t> products,campaign;unordered_map<string,uint32_t> category_ids;vector<string>categories,campaigns,channels;uint32_t unknown,organic;
     uint32_t category(SV s){auto found=category_ids.find(string(s));if(found!=category_ids.end())return found->second;uint32_t id=categories.size();categories.emplace_back(s);category_ids.emplace(s,id);return id;}
     explicit Meta(const filesystem::path&data){for(auto&p:csvs(data/"links"))rows(p,2,[&](auto&v){if(!v[0].empty()&&!v[1].empty())uf.join(v[0],v[1]);});
+        aliases.build(uf);
         rows(data/"products.csv",2,[&](auto&v){products[string(v[0])]=category(v[1]);});unknown=category("unknown");
         rows(data/"campaigns.csv",2,[&](auto&v){uint32_t id=campaigns.size();campaign.emplace(v[0],id);campaigns.emplace_back(v[0]);channels.emplace_back(v[1]);});organic=campaigns.size();campaigns.emplace_back("organic");channels.emplace_back("organic");
     }
@@ -97,7 +121,7 @@ void engine(const filesystem::path&data,const filesystem::path&work,I begin,I en
         if(v[1].empty()||v[5].empty()||(v[4]!="view"&&v[4]!="cart"&&v[4]!="purchase"))good=false;
         if(v[4]=="purchase"){auto p=v[6];bool ok=digits(p);while(p.size()>1&&p.front()=='0')p.remove_prefix(1);if(p.size()>8)ok=false;if(ok){r.price=number(p);ok=r.price>=1&&r.price<=10000000;}if(!ok)good=false;}
         if(good&&r.ingest-r.t>86400000)good=false;
-        r.valid=good;if(good){r.u=meta.uf.name(v[1]);auto cat=meta.products.find(string(v[5]));r.cat=cat==meta.products.end()?meta.unknown:cat->second;}
+        r.valid=good;if(good){r.u=meta.aliases.name(v[1]);auto cat=meta.products.find(string(v[5]));r.cat=cat==meta.products.end()?meta.unknown:cat->second;}
         add(raw[worker][bucket(r.hash)],r);
     });});
     cerr<<"native parsed "<<seconds()<<"s\n";
@@ -109,7 +133,7 @@ void engine(const filesystem::path&data,const filesystem::path&work,I begin,I en
     });
     vector<Buckets<RawEvent>>().swap(raw);cerr<<"native dedup "<<seconds()<<"s\n";
     Inputs click_input(data/"clicks");vector<Buckets<Click>> clicks(workers());
-    parallel(click_input.tasks.size(),[&](size_t n,int worker){task_rows(click_input.tasks[n],4,[&](auto&v){I ts;auto campaign=meta.campaign.find(string(v[2]));if(v[0].empty()||v[1].empty()||campaign==meta.campaign.end()||!timestamp(v[3],ts)||ts<begin-604800000||ts>=end)return;SV u=meta.uf.name(v[1]);Click c{v[0],u,ts,campaign->second};add(clicks[worker][bucket(hash_id(u))],c);});});
+    parallel(click_input.tasks.size(),[&](size_t n,int worker){task_rows(click_input.tasks[n],4,[&](auto&v){I ts;auto campaign=meta.campaign.find(string(v[2]));if(v[0].empty()||v[1].empty()||campaign==meta.campaign.end()||!timestamp(v[3],ts)||ts<begin-604800000||ts>=end)return;SV u=meta.aliases.name(v[1]);Click c{v[0],u,ts,campaign->second};add(clicks[worker][bucket(hash_id(u))],c);});});
     const I first_day=begin/86400000,last_day=(end-1)/86400000;const size_t nc=meta.campaigns.size();vector<vector<Stats>> totals(workers(),vector<Stats>((last_day-first_day+1)*nc));
     parallel(B,[&](size_t b,int worker){if(uint64_t(end-begin)<=UINT32_MAX)process_bucket<uint32_t>(b,worker,events,clicks,meta,work,begin,first_day,nc,totals);else process_bucket<uint64_t>(b,worker,events,clicks,meta,work,begin,first_day,nc,totals);});
     Output out(work/"campaign_daily.csv");out<<"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
