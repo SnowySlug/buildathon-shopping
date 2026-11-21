@@ -1,7 +1,7 @@
 FROM gcc:14-bookworm AS native
 WORKDIR /build
-COPY fastio.cpp .
-RUN g++ -O3 -DNDEBUG -std=c++17 -pthread -static-libstdc++ -static-libgcc fastio.cpp -o /fastio
+COPY fastio.cpp native.cpp ./
+RUN g++ -O3 -DNDEBUG -std=c++17 -pthread -ffunction-sections -fdata-sections -Wl,--gc-sections -static-libstdc++ -static-libgcc native.cpp -o /fastio
 
 FROM python:3.12-slim-bookworm
 RUN pip install --no-cache-dir duckdb==1.5.6 polars==1.38.1

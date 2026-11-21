@@ -1,4 +1,5 @@
 *
 !fastio.cpp
+!native.cpp
 !pipeline.py
 !Dockerfile
