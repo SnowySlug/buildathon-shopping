@@ -27,8 +27,8 @@ def main():
     con.execute("SET preserve_insertion_order=false")
     con.execute("SET temp_directory=?", [str(work / "spill")])
     q = lambda p: "'" + str(p).replace("'", "''") + "'"
-    events = q(work / "events.csv")
-    clicks = q(work / "clicks.csv")
+    events = q(work / "events-*.csv")
+    clicks = q(work / "clicks-*.csv")
     con.execute(f"""
       CREATE TABLE ev AS
       SELECT r.u AS u,r.t AS t,r.k AS k,r.cat AS cat,r.p AS p

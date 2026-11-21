@@ -1,12 +1,16 @@
 #include <algorithm>
 #include <cstdint>
+#include <atomic>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 using namespace std;
@@ -68,23 +72,42 @@ vector<filesystem::path> csvs(const filesystem::path& p) {
     vector<filesystem::path> r;for(auto &f:filesystem::directory_iterator(p))if(f.is_regular_file()&&f.path().extension()==".csv")r.push_back(f.path());sort(r.begin(),r.end());return r;
 }
 template<class F>void rows(const filesystem::path&p,size_t n,F f) {
-    ifstream in(p,ios::binary);if(!in)throw runtime_error("cannot open "+p.string());string line;getline(in,line);vector<string_view> v;
+    vector<char> buffer(1<<20);ifstream in;in.rdbuf()->pubsetbuf(buffer.data(),buffer.size());in.open(p,ios::binary);
+    if(!in)throw runtime_error("cannot open "+p.string());string line;getline(in,line);vector<string_view> v;v.reserve(n);
     while(getline(in,line))if(fields(line,v,n))f(v);
+}
+struct Output:ofstream {
+    vector<char> buffer;
+    explicit Output(const filesystem::path& p):buffer(1<<20) {rdbuf()->pubsetbuf(buffer.data(),buffer.size());open(p,ios::binary);if(!*this)throw runtime_error("cannot create "+p.string());}
+    ~Output(){close();}
+};
+template<class F>void parallel_rows(const filesystem::path& directory,const filesystem::path& work,const string& prefix,const string& header,size_t n,F f) {
+    struct Task {filesystem::path path;uintmax_t begin,end;};vector<Task> tasks;
+    for(auto path:csvs(directory)){auto bytes=filesystem::file_size(path);for(uintmax_t first=0;first<bytes;first+=(4<<20))tasks.push_back({path,first,min(bytes,first+(4<<20))});}
+    int count=max(1,min(8,getenv("NCPU")?atoi(getenv("NCPU")):4));count=min(count,max(1,int(tasks.size())));
+    atomic<size_t> next{0};exception_ptr failure;mutex error_mutex;vector<thread> threads;
+    for(int index=0;index<count;index++)threads.emplace_back([&,index]{try{
+        Output out(work/(prefix+"-"+to_string(index)+".csv"));out<<header<<'\n';vector<char> buffer(1<<20);vector<string_view> values;values.reserve(n);string line;
+        while(true){size_t k=next.fetch_add(1);if(k>=tasks.size())break;auto &task=tasks[k];ifstream input;input.rdbuf()->pubsetbuf(buffer.data(),buffer.size());input.open(task.path,ios::binary);if(!input)throw runtime_error("cannot open input");
+            uintmax_t pos=0;if(task.begin){input.seekg(task.begin-1);getline(input,line);pos=task.begin-1+line.size()+1;}else{getline(input,line);pos=line.size()+1;}
+            while(pos<task.end&&getline(input,line)){pos+=line.size()+1;if(fields(line,values,n))f(values,out);}
+        }
+    }catch(...){lock_guard<mutex> lock(error_mutex);if(!failure)failure=current_exception();next=tasks.size();}});
+    for(auto &thread:threads)thread.join();if(failure)rethrow_exception(failure);
 }
 struct Union {
     unordered_map<string,int> index;vector<int> parent,rank;vector<string> minimum;
     int add(string_view s) {auto it=index.find(string(s));if(it!=index.end())return it->second;int i=parent.size();index.emplace(s,i);parent.push_back(i);rank.push_back(0);minimum.emplace_back(s);return i;}
     int root(int x) {int y=x;while(parent[y]!=y)y=parent[y];while(parent[x]!=x){int z=parent[x];parent[x]=y;x=z;}return y;}
     void join(string_view a,string_view b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(rank[x]<rank[y])swap(x,y);parent[y]=x;minimum[x]=min(minimum[x],minimum[y]);if(rank[x]==rank[y])rank[x]++;}
-    string_view name(string_view s){auto it=index.find(string(s));return it==index.end()?s:string_view(minimum[root(it->second)]);}
+    string_view name(string_view s)const{auto it=index.find(string(s));if(it==index.end())return s;int r=it->second;while(parent[r]!=r)r=parent[r];return minimum[r];}
 };
 void sanitize(const filesystem::path& data,const filesystem::path& work,I begin,I end) {
     Union uf;for(auto p:csvs(data/"links"))rows(p,2,[&](auto&v){if(!v[0].empty()&&!v[1].empty())uf.join(v[0],v[1]);});
     unordered_map<string,string> products,campaigns;
     rows(data/"products.csv",2,[&](auto&v){products[string(v[0])]=v[1];});
     rows(data/"campaigns.csv",2,[&](auto&v){campaigns[string(v[0])]=v[1];});
-    ofstream events(work/"events.csv",ios::binary);events<<"eid,u,t,i,k,cat,p\n";
-    for(auto path:csvs(data/"events"))rows(path,7,[&](auto&v){
+    parallel_rows(data/"events",work,"events","eid,u,t,i,k,cat,p",7,[&](auto&v,auto&events){
         if(v[0].empty())return;I ts=0,ingest=0;bool good=timestamp(v[2],ts)&&ts>=begin&&ts<end;
         if(!timestamp(v[3],ingest))throw runtime_error("invalid ingest_ts outside documented input");
         int kind=v[4]=="view"?1:v[4]=="cart"?2:v[4]=="purchase"?3:0;
@@ -94,12 +117,11 @@ void sanitize(const filesystem::path& data,const filesystem::path& work,I begin,
         if(!v[5].empty()){auto it=products.find(string(v[5]));text(events,it==products.end()?string_view("unknown"):string_view(it->second));}
         events<<',';if(priceok)events<<price;events<<'\n';
     });
-    events.close();ofstream clicks(work/"clicks.csv",ios::binary);clicks<<"id,u,c,t\n";
-    for(auto path:csvs(data/"clicks"))rows(path,4,[&](auto&v){
+    parallel_rows(data/"clicks",work,"clicks","id,u,c,t",4,[&](auto&v,auto&clicks){
         I ts=0;if(v[0].empty()||v[1].empty()||!campaigns.count(string(v[2]))||!timestamp(v[3],ts)||ts<begin-604800000||ts>=end)return;
         text(clicks,v[0]);clicks<<',';text(clicks,uf.name(v[1]));clicks<<',';text(clicks,v[2]);clicks<<','<<ts<<'\n';
     });
-    ofstream channels(work/"channels.csv",ios::binary);channels<<"campaign_id,channel\n";for(auto &[c,ch]:campaigns){text(channels,c);channels<<',';text(channels,ch);channels<<'\n';}
+    Output channels(work/"channels.csv");channels<<"campaign_id,channel\n";for(auto &[c,ch]:campaigns){text(channels,c);channels<<',';text(channels,ch);channels<<'\n';}
 }
 struct Stats {I sessions=0,purchasing=0,revenue=0,assists=0;};
 void reduce(const filesystem::path& work) {
@@ -114,7 +136,7 @@ void reduce(const filesystem::path& work) {
         I day=ts/86400000;string credit=latest>=lower?lastcampaign:"organic";auto &st=result[{day,credit}];st.sessions++;st.revenue+=number(v[5]);st.purchasing+=number(v[6]);
         for(auto &[campaign,count]:counts)result[{day,campaign}].assists++;
     });
-    ofstream out(work/"campaign_daily.csv",ios::binary);out<<"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
+    Output out(work/"campaign_daily.csv");out<<"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
     for(auto &[key,s]:result){auto &[day,c]=key;text(out,c);out<<',';text(out,c=="organic"?string_view("organic"):string_view(channel.at(c)));out<<','<<date(day)<<','<<s.sessions<<','<<s.purchasing<<','<<s.revenue<<','<<s.assists<<'\n';}
 }
 int main(int argc,char**argv){try{if(argc>=2&&string(argv[1])=="sanitize"&&argc==6)sanitize(argv[2],argv[3],stoll(argv[4]),stoll(argv[5]));else if(argc==3&&string(argv[1])=="reduce")reduce(argv[2]);else throw runtime_error("usage: fastio sanitize DATA WORK BEGIN END | fastio reduce WORK");}catch(exception&e){cerr<<e.what()<<'\n';return 1;}return 0;}

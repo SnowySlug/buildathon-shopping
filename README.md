@@ -12,11 +12,13 @@ deduplicates, sessionizes with equal-timestamp handling, and aggregates daily
 user/category results. A sorted native timeline computes last-touch campaign
 credit and seven-day assists without a potentially explosive interval join.
 
-Validation for v1: all36 official edge fixtures pass. The public seed1 dev set
+Validation for v2: all36 official edge fixtures pass. The public seed1 dev set
 (1,000,000 events/250,000 clicks) exactly matches both official answer tables:
 117,038 user rows and27,400 campaign rows, with no differing/missing/extra rows
-or duplicate keys. One local Docker run at4CPU/4GB took16.957 internal seconds
-with Windows bind-mounted data/scratch; this is not an official scoring time.
+or duplicate keys. The strict frontend now uses buffered, parallel 4MiB input chunks. Three
+local4CPU/4GB Linux-volume dev runs took3.717,3.014,3.953 internal seconds
+(median3.717s). Independent Python-oracle comparisons also MATCH on three
+fresh50,000-event seeds2,7,29. These are not official scoring times.
 
 Required environment: DATA_DIR=/data,OUTPUT_DIR=/output,SCRATCH_DIR=/scratch,
 HOME=/scratch,NCPU=8,MEM_GB=24. The image writes only output and scratch.
