@@ -1,4 +1,4 @@
-# Shopping Sessions native entry
+# Shopping Sessions compact native entry
 
 Exact C++17 pipeline for the 2026 Builders Buildathon Shopping Sessions track.
 DuckDB is used only to convert the final daily aggregate CSVs to Parquet.
@@ -8,8 +8,9 @@ price validation, and transitive linked IDs with byte-wise minimum names.
 It maps source files read-only, parses independent 4MiB chunks in parallel,
 and partitions event IDs into64 shards. A collision-checked hash table selects
 the earliest ingestion copy before validation. Surviving events are repartitioned
-by canonical person, sorted by event time, and streamed into sessions and daily
-aggregates. A sliding seven-day click window computes latest-click credit and
+by canonical person, interned to exact per-shard integer IDs, sorted by event
+time, and streamed into sessions and daily aggregates. Normal-window event
+records are16bytes; wider windows use64-bit timestamp offsets. A sliding seven-day click window computes latest-click credit and
 distinct campaign assists without expanding a large interval join. Source
 hashes only partition/look up exact IDs; every equality checks the original ID.
 
@@ -32,10 +33,15 @@ and Polars1.38.1 (only needed by local validation tools).
 - An independent Python oracle, itself validated on36/36 fixtures, matches fresh
  50,000-event/12,500-click generator seeds2,7,29. Seed29 was rerun after the final
   explicit intermediate-CSV dialect fix and matched again.
-- Final-code1M local4CPU/4GB Linux-volume runs:1.855,1.314,1.391 internal seconds
-  (median1.391s). Host contention varied. These are not official scoring times.
-- Full-size memory/runtime scaling remains to be measured; no final-size result
-  is claimed by these small-data checks.
+- Final-code1M local4CPU/4GB Linux-volume runs:0.447,0.662,0.357 internal seconds
+  (median0.447s). Host contention varied. These are not official scoring times.
+- 20M-event/5M-click seed11 at8CPU/6GB:16.291 internal seconds,2.43GiB peak.
+  All20M outputs match native-v3 exactly. Native-v3 recent repeat was14.614s,
+  so no20M speed improvement is established. This is an exploratory alternative,
+  not a promoted faster final. Full60M/24GB remains unmeasured.
+- Independent special cases also match the oracle:2-year wide-window fallback,
+  NUL/Unicode IDs,bytewise ties,long leading zeros,leap day,and invalid earliest
+  duplicate handling.
 
 ## Sources and disclosure
 

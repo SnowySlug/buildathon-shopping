@@ -34,8 +34,8 @@ struct Meta{Union uf;unordered_map<string,uint32_t> products,campaign;unordered_
     }
 };
 struct RawEvent{SV id,u;I t=0,ingest=0;uint64_t hash=0;uint32_t price=0,cat=0;bool valid=false;};
-struct Event{SV u;I t;uint64_t hash;uint32_t price,cat;};
-struct Click{SV id,u;I t;uint64_t hash;uint32_t campaign;};
+struct Event{SV u;I t;uint32_t price,cat;};
+struct Click{SV id,u;I t;uint32_t campaign;};
 template<class T>using Buckets=array<vector<T>,B>;
 template<class T>void add(vector<T>&v,const T&value){if(v.empty()&&!v.capacity())v.reserve(4096);v.push_back(value);}
 size_t slot_count(size_t n){size_t cap=8;while(cap<n+n/3+1)cap*=2;return cap;}
@@ -43,6 +43,38 @@ vector<Event> combine_events(vector<Buckets<Event>>&from,int b){size_t n=0;for(a
 vector<Click> combine_clicks(vector<Buckets<Click>>&from,int b){size_t n=0;for(auto&group:from)n+=group[b].size();vector<Click> result;result.reserve(n);for(auto&group:from){result.insert(result.end(),group[b].begin(),group[b].end());vector<Click>().swap(group[b]);}return result;}
 bool user_less(uint64_t ah,SV a,uint64_t bh,SV b){return ah!=bh?ah<bh:a<b;}
 struct DayStats{I day,sessions=0,events=0,revenue=0;vector<I>category;};
+struct UserIndex{
+    struct Name{SV u;uint64_t hash;};vector<Name> names;vector<uint32_t> slots=vector<uint32_t>(2048,UINT32_MAX);
+    uint32_t get(SV u){uint64_t hash=hash_id(u);if(names.size()*2>=slots.size()){vector<uint32_t>next(slots.size()*2,UINT32_MAX);for(uint32_t i=0;i<names.size();i++){size_t k=names[i].hash&(next.size()-1);while(next[k]!=UINT32_MAX)k=(k+1)&(next.size()-1);next[k]=i;}slots.swap(next);}
+        size_t k=hash&(slots.size()-1);while(slots[k]!=UINT32_MAX){auto&n=names[slots[k]];if(n.hash==hash&&n.u==u)return slots[k];k=(k+1)&(slots.size()-1);}uint32_t i=names.size();slots[k]=i;names.push_back({u,hash});return i;
+    }
+};
+template<class Time>struct PackedEvent{Time t;uint32_t user,price,cat;};
+struct PackedClick{I t;uint32_t user,campaign;SV id;};
+template<class Time>void process_bucket(size_t b,int worker,vector<Buckets<Event>>&events,vector<Buckets<Click>>&clicks,
+ const Meta&meta,const filesystem::path&work,I begin,I first_day,size_t nc,vector<vector<Stats>>&totals){
+    UserIndex users;auto source=combine_events(events,b);vector<PackedEvent<Time>> ev;ev.reserve(source.size());
+    for(auto&r:source)ev.push_back({Time(r.t-begin),users.get(r.u),r.price,r.cat});vector<Event>().swap(source);
+    auto clraw=combine_clicks(clicks,b);vector<uint32_t>slots(slot_count(clraw.size()),UINT32_MAX);vector<uint32_t>unique;unique.reserve(clraw.size());
+    for(uint32_t i=0;i<clraw.size();i++){auto&r=clraw[i];size_t k=hash_id(r.id)&(slots.size()-1);while(slots[k]!=UINT32_MAX&&clraw[unique[slots[k]]].id!=r.id)k=(k+1)&(slots.size()-1);if(slots[k]==UINT32_MAX){slots[k]=unique.size();unique.push_back(i);}}
+    vector<PackedClick>cl;cl.reserve(unique.size());for(uint32_t i:unique){auto&r=clraw[i];cl.push_back({r.t,users.get(r.u),r.campaign,r.id});}vector<Click>().swap(clraw);vector<uint32_t>().swap(slots);vector<uint32_t>().swap(unique);
+    sort(ev.begin(),ev.end(),[](auto&a,auto&b){return a.user!=b.user?a.user<b.user:a.t<b.t;});
+    sort(cl.begin(),cl.end(),[](auto&a,auto&b){return a.user!=b.user?a.user<b.user:a.t<b.t;});
+    Output out(work/("users-"+to_string(b)+".csv"));out<<"user_id,day,sessions,events,revenue_cents,top_category\n";size_t e=0,c=0;
+    while(e<ev.size()){size_t ee=e+1;while(ee<ev.size()&&ev[ee].user==ev[e].user)ee++;uint32_t user=ev[e].user;SV u=users.names[user].u;
+        while(c<cl.size()&&cl[c].user<user)c++;size_t ce=c;while(ce<cl.size()&&cl[ce].user==user)ce++;
+        size_t lo=c,hi=c;I latest=-1;SV latest_id;uint32_t credited=meta.organic;vector<DayStats>daily;unordered_map<uint32_t,uint32_t>active;
+        while(e<ee){size_t stop=e+1;while(stop<ee&&ev[stop].t-ev[stop-1].t<=1800000)stop++;I start=begin+ev[e].t,day=start/86400000;
+            if(daily.empty()||daily.back().day!=day)daily.push_back(DayStats{day});auto&d=daily.back();d.sessions++;d.events+=stop-e;I revenue=0;
+            for(size_t i=e;i<stop;i++){revenue+=ev[i].price;if(ev[i].price){if(d.category.empty())d.category.resize(meta.categories.size(),0);d.category[ev[i].cat]+=ev[i].price;}}d.revenue+=revenue;
+            while(hi<ce&&cl[hi].t<=start){auto&r=cl[hi];active[r.campaign]++;if(r.t>latest||(r.t==latest&&r.id<latest_id)){latest=r.t;latest_id=r.id;credited=r.campaign;}hi++;}
+            I lower=start-604800000;while(lo<hi&&cl[lo].t<lower){auto it=active.find(cl[lo].campaign);if(--it->second==0)active.erase(it);lo++;}
+            uint32_t credit=latest>=lower?credited:meta.organic;auto&stats=totals[worker][(day-first_day)*nc+credit];stats.sessions++;stats.purchasing+=revenue>0;stats.revenue+=revenue;
+            for(auto&[campaign,count]:active)totals[worker][(day-first_day)*nc+campaign].assists++;e=stop;
+        }
+        for(auto&d:daily){text(out,u);out<<','<<date(d.day)<<','<<d.sessions<<','<<d.events<<','<<d.revenue<<',';I best=0;uint32_t cat=0;for(uint32_t i=0;i<d.category.size();i++)if(d.category[i]>best||(d.category[i]==best&&best&&meta.categories[i]<meta.categories[cat])){best=d.category[i];cat=i;}if(best)text(out,meta.categories[cat]);out<<'\n';}c=ce;
+    }
+}
 void engine(const filesystem::path&data,const filesystem::path&work,I begin,I end){
     const auto started=chrono::steady_clock::now();auto seconds=[&](){return chrono::duration<double>(chrono::steady_clock::now()-started).count();};
     const Meta meta(data);Inputs event_input(data/"events");vector<Buckets<RawEvent>> raw(workers());
@@ -59,36 +91,14 @@ void engine(const filesystem::path&data,const filesystem::path&work,I begin,I en
     vector<Buckets<Event>> events(workers());
     parallel(B,[&](size_t b,int worker){size_t n=0;for(auto&group:raw)n+=group[b].size();if(n>=UINT32_MAX)throw runtime_error("dedup partition too large");vector<uint32_t>slots(slot_count(n),UINT32_MAX);vector<RawEvent*> unique;unique.reserve(n);
         for(auto&group:raw)for(auto&r:group[b]){size_t k=r.hash&(slots.size()-1);while(slots[k]!=UINT32_MAX){auto*old=unique[slots[k]];if(old->hash==r.hash&&old->id==r.id){if(r.ingest<old->ingest)unique[slots[k]]=&r;break;}k=(k+1)&(slots.size()-1);}if(slots[k]==UINT32_MAX){slots[k]=unique.size();unique.push_back(&r);}}
-        for(auto*r:unique)if(r->valid){Event e{r->u,r->t,hash_id(r->u),r->price,r->cat};add(events[worker][bucket(e.hash)],e);}
+        for(auto*r:unique)if(r->valid){Event e{r->u,r->t,r->price,r->cat};add(events[worker][bucket(hash_id(e.u))],e);}
         for(auto&group:raw)vector<RawEvent>().swap(group[b]);
     });
     vector<Buckets<RawEvent>>().swap(raw);cerr<<"native dedup "<<seconds()<<"s\n";
     Inputs click_input(data/"clicks");vector<Buckets<Click>> clicks(workers());
-    parallel(click_input.tasks.size(),[&](size_t n,int worker){task_rows(click_input.tasks[n],4,[&](auto&v){I ts;auto campaign=meta.campaign.find(string(v[2]));if(v[0].empty()||v[1].empty()||campaign==meta.campaign.end()||!timestamp(v[3],ts)||ts<begin-604800000||ts>=end)return;SV u=meta.uf.name(v[1]);Click c{v[0],u,ts,hash_id(u),campaign->second};add(clicks[worker][bucket(c.hash)],c);});});
+    parallel(click_input.tasks.size(),[&](size_t n,int worker){task_rows(click_input.tasks[n],4,[&](auto&v){I ts;auto campaign=meta.campaign.find(string(v[2]));if(v[0].empty()||v[1].empty()||campaign==meta.campaign.end()||!timestamp(v[3],ts)||ts<begin-604800000||ts>=end)return;SV u=meta.uf.name(v[1]);Click c{v[0],u,ts,campaign->second};add(clicks[worker][bucket(hash_id(u))],c);});});
     const I first_day=begin/86400000,last_day=(end-1)/86400000;const size_t nc=meta.campaigns.size();vector<vector<Stats>> totals(workers(),vector<Stats>((last_day-first_day+1)*nc));
-    parallel(B,[&](size_t b,int worker){auto ev=combine_events(events,b);auto cl=combine_clicks(clicks,b);
-        vector<uint32_t>slots(slot_count(cl.size()),UINT32_MAX);vector<Click>unique;unique.reserve(cl.size());
-        for(auto&r:cl){size_t k=hash_id(r.id)&(slots.size()-1);while(slots[k]!=UINT32_MAX&&unique[slots[k]].id!=r.id)k=(k+1)&(slots.size()-1);if(slots[k]==UINT32_MAX){slots[k]=unique.size();unique.push_back(r);}}
-        vector<Click>().swap(cl);vector<uint32_t>().swap(slots);cl=move(unique);
-        sort(ev.begin(),ev.end(),[](auto&a,auto&b){if(a.hash!=b.hash)return a.hash<b.hash;if(a.u!=b.u)return a.u<b.u;return a.t<b.t;});
-        sort(cl.begin(),cl.end(),[](auto&a,auto&b){if(a.hash!=b.hash)return a.hash<b.hash;if(a.u!=b.u)return a.u<b.u;return a.t!=b.t?a.t<b.t:a.id<b.id;});
-        Output out(work/("users-"+to_string(b)+".csv"));out<<"user_id,day,sessions,events,revenue_cents,top_category\n";size_t e=0,c=0;
-        while(e<ev.size()){size_t ee=e+1;while(ee<ev.size()&&ev[ee].u==ev[e].u)ee++;auto u=ev[e].u;auto uh=ev[e].hash;
-            while(c<cl.size()&&user_less(cl[c].hash,cl[c].u,uh,u))c++;size_t ce=c;while(ce<cl.size()&&cl[ce].u==u)ce++;
-            size_t lo=c,hi=c;I latest=-1;uint32_t credited=meta.organic;vector<DayStats> daily;unordered_map<uint32_t,uint32_t> active;
-            while(e<ee){size_t stop=e+1;while(stop<ee&&ev[stop].t-ev[stop-1].t<=1800000)stop++;I start=ev[e].t,day=start/86400000;
-                if(daily.empty()||daily.back().day!=day)daily.push_back(DayStats{day});auto&d=daily.back();d.sessions++;d.events+=stop-e;I revenue=0;
-                for(size_t i=e;i<stop;i++){revenue+=ev[i].price;if(ev[i].price){if(d.category.empty())d.category.resize(meta.categories.size(),0);d.category[ev[i].cat]+=ev[i].price;}}d.revenue+=revenue;
-                while(hi<ce&&cl[hi].t<=start){auto&r=cl[hi];active[r.campaign]++;if(r.t>latest){latest=r.t;credited=r.campaign;}hi++;}
-                I lower=start-604800000;while(lo<hi&&cl[lo].t<lower){auto it=active.find(cl[lo].campaign);if(--it->second==0)active.erase(it);lo++;}
-                uint32_t credit=latest>=lower?credited:meta.organic;auto&stats=totals[worker][(day-first_day)*nc+credit];stats.sessions++;stats.purchasing+=revenue>0;stats.revenue+=revenue;
-                for(auto &[campaign,count]:active)totals[worker][(day-first_day)*nc+campaign].assists++;
-                e=stop;
-            }
-            for(auto&d:daily){text(out,u);out<<','<<date(d.day)<<','<<d.sessions<<','<<d.events<<','<<d.revenue<<',';I best=0;uint32_t cat=0;for(uint32_t i=0;i<d.category.size();i++)if(d.category[i]>best||(d.category[i]==best&&best&&meta.categories[i]<meta.categories[cat])){best=d.category[i];cat=i;}if(best)text(out,meta.categories[cat]);out<<'\n';}
-            c=ce;
-        }
-    });
+    parallel(B,[&](size_t b,int worker){if(uint64_t(end-begin)<=UINT32_MAX)process_bucket<uint32_t>(b,worker,events,clicks,meta,work,begin,first_day,nc,totals);else process_bucket<uint64_t>(b,worker,events,clicks,meta,work,begin,first_day,nc,totals);});
     Output out(work/"campaign_daily.csv");out<<"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
     for(I day=first_day;day<=last_day;day++)for(uint32_t c=0;c<nc;c++){Stats sum;for(auto&all:totals){auto&s=all[(day-first_day)*nc+c];sum.sessions+=s.sessions;sum.purchasing+=s.purchasing;sum.revenue+=s.revenue;sum.assists+=s.assists;}if(sum.sessions||sum.assists){text(out,meta.campaigns[c]);out<<',';text(out,meta.channels[c]);out<<','<<date(day)<<','<<sum.sessions<<','<<sum.purchasing<<','<<sum.revenue<<','<<sum.assists<<'\n';}}
     cerr<<"native finished "<<seconds()<<"s\n";
