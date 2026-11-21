@@ -51,6 +51,16 @@ struct UserIndex{
 };
 template<class Time>struct PackedEvent{Time t;uint32_t user,price,cat;};
 struct PackedClick{I t;uint32_t user,campaign;SV id;};
+template<class Row,class Key>void radix_order(vector<Row>&items,Key key){
+    if(items.size()<2)return;uint64_t maximum=0;for(auto&r:items)maximum=max(maximum,uint64_t(key(r)));if(!maximum)return;
+    vector<Row> buffer(items.size());
+    for(unsigned shift=0;shift<64&&(maximum>>shift);shift+=8){
+        array<size_t,256> offset{};for(auto&r:items)offset[(uint64_t(key(r))>>shift)&255]++;
+        size_t prefix=0;for(auto&count:offset){size_t old=count;count=prefix;prefix+=old;}
+        for(auto&r:items)buffer[offset[(uint64_t(key(r))>>shift)&255]++]=r;
+        items.swap(buffer);
+    }
+}
 template<class Time>void process_bucket(size_t b,int worker,vector<Buckets<Event>>&events,vector<Buckets<Click>>&clicks,
  const Meta&meta,const filesystem::path&work,I begin,I first_day,size_t nc,vector<vector<Stats>>&totals){
     UserIndex users;auto source=combine_events(events,b);vector<PackedEvent<Time>> ev;ev.reserve(source.size());
@@ -58,8 +68,11 @@ template<class Time>void process_bucket(size_t b,int worker,vector<Buckets<Event
     auto clraw=combine_clicks(clicks,b);vector<uint32_t>slots(slot_count(clraw.size()),UINT32_MAX);vector<uint32_t>unique;unique.reserve(clraw.size());
     for(uint32_t i=0;i<clraw.size();i++){auto&r=clraw[i];size_t k=hash_id(r.id)&(slots.size()-1);while(slots[k]!=UINT32_MAX&&clraw[unique[slots[k]]].id!=r.id)k=(k+1)&(slots.size()-1);if(slots[k]==UINT32_MAX){slots[k]=unique.size();unique.push_back(i);}}
     vector<PackedClick>cl;cl.reserve(unique.size());for(uint32_t i:unique){auto&r=clraw[i];cl.push_back({r.t,users.get(r.u),r.campaign,r.id});}vector<Click>().swap(clraw);vector<uint32_t>().swap(slots);vector<uint32_t>().swap(unique);
-    sort(ev.begin(),ev.end(),[](auto&a,auto&b){return a.user!=b.user?a.user<b.user:a.t<b.t;});
-    sort(cl.begin(),cl.end(),[](auto&a,auto&b){return a.user!=b.user?a.user<b.user:a.t<b.t;});
+    if constexpr(sizeof(Time)<=4){radix_order(ev,[](auto&r){return (uint64_t(r.user)<<32)|uint64_t(r.t);});}
+    else{radix_order(ev,[](auto&r){return uint64_t(r.t);});radix_order(ev,[](auto&r){return uint64_t(r.user);});}
+    I click_base=begin-604800000;uint64_t click_span=0;for(auto&r:cl)click_span=max(click_span,uint64_t(r.t-click_base));
+    if(click_span<=UINT32_MAX){radix_order(cl,[&](auto&r){return (uint64_t(r.user)<<32)|uint64_t(r.t-click_base);});}
+    else{radix_order(cl,[&](auto&r){return uint64_t(r.t-click_base);});radix_order(cl,[](auto&r){return uint64_t(r.user);});}
     Output out(work/("users-"+to_string(b)+".csv"));out<<"user_id,day,sessions,events,revenue_cents,top_category\n";size_t e=0,c=0;
     while(e<ev.size()){size_t ee=e+1;while(ee<ev.size()&&ev[ee].user==ev[e].user)ee++;uint32_t user=ev[e].user;SV u=users.names[user].u;
         while(c<cl.size()&&cl[c].user<user)c++;size_t ce=c;while(ce<cl.size()&&cl[ce].user==user)ce++;
@@ -89,8 +102,8 @@ void engine(const filesystem::path&data,const filesystem::path&work,I begin,I en
     });});
     cerr<<"native parsed "<<seconds()<<"s\n";
     vector<Buckets<Event>> events(workers());
-    parallel(B,[&](size_t b,int worker){size_t n=0;for(auto&group:raw)n+=group[b].size();if(n>=UINT32_MAX)throw runtime_error("dedup partition too large");vector<uint32_t>slots(slot_count(n),UINT32_MAX);vector<RawEvent*> unique;unique.reserve(n);
-        for(auto&group:raw)for(auto&r:group[b]){size_t k=r.hash&(slots.size()-1);while(slots[k]!=UINT32_MAX){auto*old=unique[slots[k]];if(old->hash==r.hash&&old->id==r.id){if(r.ingest<old->ingest)unique[slots[k]]=&r;break;}k=(k+1)&(slots.size()-1);}if(slots[k]==UINT32_MAX){slots[k]=unique.size();unique.push_back(&r);}}
+    parallel(B,[&](size_t b,int worker){size_t n=0;for(auto&group:raw)n+=group[b].size();if(n>=UINT32_MAX)throw runtime_error("dedup partition too large");struct Slot{uint32_t fingerprint=0,index=UINT32_MAX;};vector<Slot>slots(slot_count(n));vector<RawEvent*> unique;unique.reserve(n);
+        for(auto&group:raw)for(auto&r:group[b]){uint32_t fingerprint=r.hash>>32;size_t k=r.hash&(slots.size()-1);while(slots[k].index!=UINT32_MAX){if(slots[k].fingerprint==fingerprint){auto*old=unique[slots[k].index];if(old->hash==r.hash&&old->id==r.id){if(r.ingest<old->ingest)unique[slots[k].index]=&r;break;}}k=(k+1)&(slots.size()-1);}if(slots[k].index==UINT32_MAX){slots[k]={fingerprint,uint32_t(unique.size())};unique.push_back(&r);}}
         for(auto*r:unique)if(r->valid){Event e{r->u,r->t,r->price,r->cat};add(events[worker][bucket(hash_id(e.u))],e);}
         for(auto&group:raw)vector<RawEvent>().swap(group[b]);
     });
