@@ -89,9 +89,11 @@ template<class Time>void process_bucket(size_t b,int worker,vector<Buckets<Event
  const Meta&meta,const filesystem::path&work,I begin,I first_day,size_t nc,vector<vector<Stats>>&totals){
     UserIndex users;auto source=combine_events(events,b);vector<PackedEvent<Time>> ev;ev.reserve(source.size());
     for(auto&r:source)ev.push_back({Time(r.t-begin),users.get(r.u),r.price,r.cat});vector<Event>().swap(source);
-    auto clraw=combine_clicks(clicks,b);vector<uint32_t>slots(slot_count(clraw.size()),UINT32_MAX);vector<uint32_t>unique;unique.reserve(clraw.size());
-    for(uint32_t i=0;i<clraw.size();i++){auto&r=clraw[i];size_t k=hash_id(r.id)&(slots.size()-1);while(slots[k]!=UINT32_MAX&&clraw[unique[slots[k]]].id!=r.id)k=(k+1)&(slots.size()-1);if(slots[k]==UINT32_MAX){slots[k]=unique.size();unique.push_back(i);}}
-    vector<PackedClick>cl;cl.reserve(unique.size());for(uint32_t i:unique){auto&r=clraw[i];cl.push_back({r.t,users.get(r.u),r.campaign,r.id});}vector<Click>().swap(clraw);vector<uint32_t>().swap(slots);vector<uint32_t>().swap(unique);
+    // Copies of a click have identical parsed values. Selection of max timestamp,
+    // min bytewise click ID and the set of assisting campaigns are idempotent.
+    // Duplicate active counts enter and expire at exactly the same timestamps.
+    auto clraw=combine_clicks(clicks,b);vector<PackedClick>cl;cl.reserve(clraw.size());
+    for(auto&r:clraw)cl.push_back({r.t,users.get(r.u),r.campaign,r.id});vector<Click>().swap(clraw);
     if constexpr(sizeof(Time)<=4){radix_order(ev,[](auto&r){return (uint64_t(r.user)<<32)|uint64_t(r.t);});}
     else{radix_order(ev,[](auto&r){return uint64_t(r.t);});radix_order(ev,[](auto&r){return uint64_t(r.user);});}
     I click_base=begin-604800000;uint64_t click_span=0;for(auto&r:cl)click_span=max(click_span,uint64_t(r.t-click_base));

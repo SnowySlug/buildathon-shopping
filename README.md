@@ -23,22 +23,27 @@ SCRATCH_DIR=/scratch. It supports NCPU=8, MEM_GB=24, HOME=/scratch, read-only ro
 offline execution, uid 1000 and 64 MiB /tmp. Dependencies: Python, DuckDB 1.5.6;
 Polars 1.38.1 is installed for local validation support.
 
+Click-ID deduplication is omitted because the rules guarantee identical
+parsed values for all copies. Choosing the latest timestamp then smallest ID
+and taking the set of assisting campaigns are idempotent under duplicate copies.
+Duplicate active counts enter and expire at identical timestamps.
+
 ## Validation and measured limits
 
 - All 36 official fixtures pass.
 - Public 1M events/250k clicks: exact official answer match, 117,038 user rows
-  and 27,400 campaign rows; zero differing or duplicate-key rows.
+  and 27,400 campaign rows; no differing or duplicate-key rows.
 - Independent Python oracle: exact matches for 50k-event seeds 2, 7 and 29.
-- Independent edge cases: Unicode/NUL IDs, wide timestamps, bytewise ties,
-  long leading zeros, leap day and invalid earliest duplicate copies all match.
-- Representative 20M events/5M clicks: exact all-row match against prior v5,
+- Unicode/NUL IDs, wide timestamps, bytewise click ties, long leading zeros,
+  leap day and invalid earliest duplicates match the independent oracle.
+- Representative 20M events/5M clicks: exact all-row match against frozen V6,
   2,237,784 user rows and 28,014 campaign rows, zero duplicate-key errors.
-- Quiet ABBA local 8-CPU/6-GB comparison, v5/alias/alias/v5 CPU seconds:
-  42.468 / 34.679 / 35.473 / 40.143. Alias mean 35.076 versus 41.306,
-  about 15.1% lower. Internal wall means: 6.849 versus 7.556 seconds,
-  about 9.4% lower. Candidate peaks were 2.42-2.56 GiB. These are local
-  Docker Desktop measurements, not official scores; host variance remains.
-- Final 60M/24GB execution is unmeasured. No official improvement is claimed.
+- Quiet ABBA local 8-CPU/6-GB comparison V6/candidate/candidate/V6 CPU seconds:
+  55.723 / 37.443 / 35.851 / 42.357. Internal seconds:
+  9.598 / 7.063 / 6.984 / 9.560. Both candidate runs use less CPU than both
+  controls, but unchanged parsing stages also vary; no exact causal percentage
+  or official improvement is claimed. Candidate peak memory is 2.50-2.55 GiB.
+- Final 60M/24GB execution is unmeasured.
 
 ## Sources and AI disclosure
 
